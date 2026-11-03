@@ -1,0 +1,6 @@
+# 機器ごとの設定（トークン・GAS URL を含む）はコミットしない。config.example.py を参照
+config.py
+.venv/
+__pycache__/
+.pytest_cache/
+device_snapshot_*/

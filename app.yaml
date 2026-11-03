@@ -1,0 +1,8 @@
+id: maixcam2_custom
+name: Custom Detector
+name[zh]: カスタム検知
+version: 1.0.0
+author: futurocketco
+icon: icon.png
+desc: Custom YOLOv8/YOLO11 detection with HTTP reporting
+exec: main.py
