@@ -1,6 +1,6 @@
 {
   "config_override": {
-    "power_save_time": "00000000",
+    "power_save_time": "00470051",
     "ota_check_interval": 300
   }
 }
