@@ -1,0 +1,5 @@
+{
+  "config_override": {
+    "power_save_time": "00000000"
+  }
+}

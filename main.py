@@ -3,17 +3,36 @@ MaixCam 2 カスタム検知アプリ
 
 maixIII_custom を MaixCam 2（Axera AX630C / MaixPy 4.x）向けに移植。
 config.py の MODE を "coco" / "custom" で切り替えてA/Bテスト可能。
+
+画像送信は image_uploader（失敗時 1 回だけ再送）、指定時間帯の省電力は power_save、
+power_save_time 等の遠隔変更は ota_config（GitHub manifest）が担当する。
 """
 
 import config
 import datetime
 import time
 import requests
-import base64
 import os
+import gc
 from collections import deque
 
 from maix import camera, display, image, nn, app, touchscreen
+
+import image_uploader
+import ota_config
+import power_save
+
+# 新しい設定項目（config.py に無い古い設定ファイルでも動くよう既定値を入れる）
+for _name, _default in (
+    ("POWER_SAVE_TIME", power_save.DISABLED),
+    ("GDRIVE_UPLOAD_RETRY_ENABLED", True),
+    ("GDRIVE_RETRY_DELAY_SEC", 3.0),
+    ("OTA_MANIFEST_BASE_URL", ""),
+    ("OTA_DEVICE_ID", ""),
+    ("OTA_CHECK_INTERVAL", 3600),
+):
+    if not hasattr(config, _name):
+        setattr(config, _name, _default)
 
 
 # ── ロギング ──────────────────────────────────────────────
@@ -58,23 +77,28 @@ def save_detection_snapshot(img, name: str):
         log(f"[ ERROR ] snapshot save failed ({name}): {e}")
 
 
+def _retry_allowed() -> bool:
+    """省電力中・省電力開始直前は再送しない（省電力への移行を優先）"""
+    now = power_save.now_jst()
+    delay = float(config.GDRIVE_RETRY_DELAY_SEC)
+    return not (power_save.in_window(config.POWER_SAVE_TIME, now)
+                or power_save.starts_within(config.POWER_SAVE_TIME, now, delay + 1))
+
+
+# 送信はワーカースレッドで行う（再送待ちでメインループを止めない）
+uploader = image_uploader.ImageUploader(
+    url_fn           = lambda: config.GAS_URL,
+    log_fn           = log,
+    retry_enabled_fn = lambda: config.GDRIVE_UPLOAD_RETRY_ENABLED,
+    retry_delay_fn   = lambda: float(config.GDRIVE_RETRY_DELAY_SEC),
+    retry_allowed_fn = _retry_allowed,
+)
+
+
 def _post_image_bytes(data: bytes, label_name: str, ts: datetime.datetime):
     if not config.GAS_URL:
         return
-    try:
-        payload = {
-            "image"   : base64.b64encode(data).decode(),
-            "label"   : label_name,
-            "date"    : ts.strftime("%Y-%m-%d"),
-            "filename": ts.strftime("%Y%m%d_%H%M%S") + ".jpg",
-        }
-        resp = requests.post(config.GAS_URL, json=payload, timeout=30)
-        if not resp.ok:
-            log(f"[ ERROR ] gdrive upload failed ({label_name}): {resp.status_code}")
-        else:
-            log(f"[ INFO ] gdrive uploaded: {label_name}/{ts.strftime('%Y-%m-%d')}/{payload['filename']}")
-    except Exception as e:
-        log(f"[ ERROR ] gdrive upload exception ({label_name}): {e}")
+    uploader.submit(data, label_name, ts)
 
 
 def upload_to_gdrive(img, label_name: str, ts: datetime.datetime):
@@ -121,6 +145,88 @@ def load_model(model_path: str, model_class: str):
         return nn.YOLO11(model=model_path, dual_buff=True)
 
 
+def open_camera_and_model():
+    yolo = load_model(config.MODEL_PATH, config.MODEL_CLASS)
+    cam  = camera.Camera(yolo.input_width(), yolo.input_height(), yolo.input_format())
+    return cam, yolo
+
+
+# ── 04:00 再起動 ───────────────────────────────────────────
+
+def check_scheduled_reboot(state: dict):
+    """毎日 04:00 に自己再起動（起動直後はスキップしてリブートループを防ぐ）"""
+    now_dt = datetime.datetime.now()
+    with open('/proc/uptime') as _f:
+        _uptime = float(_f.read().split()[0])
+    if now_dt.hour == 4 and now_dt.minute == 0 and not state["restart_triggered"] and _uptime > 300:
+        state["restart_triggered"] = True
+        log("[ INFO ] 04:00 scheduled reboot")
+        os.system("reboot")
+
+
+# ── 省電力モード ───────────────────────────────────────────
+
+def power_save_active(state: dict) -> bool:
+    """いま省電力時間帯か。時刻が取れていなければ通常動作（警告は一度だけ）"""
+    now = power_save.now_jst()
+    if not power_save.time_is_valid(now):
+        if not state["time_warned"]:
+            state["time_warned"] = True
+            log(f"[ ERROR ] power save: system time looks invalid ({now:%Y-%m-%d %H:%M}), staying in normal mode")
+        return False
+    state["time_warned"] = False
+    return power_save.in_window(config.POWER_SAVE_TIME, now)
+
+
+def run_power_save(disp, ota, state: dict, screen_on: bool = False):
+    """省電力時間帯が終わるまで待機する（カメラ・YOLO・送信は止めた状態で呼ぶ）"""
+    log(f"[ INFO ] power save start (power_save_time={config.POWER_SAVE_TIME})")
+    # 消灯済みのときに set_backlight_off() を呼ぶと、MaixPy 内部で戻らなくなることがある
+    # （2026-11-03 実機で確認）。画面を点けているときだけ、フェードなしで消す。
+    if screen_on:
+        disp.set_backlight_off(0)
+    uploader.cancel_retry()   # 送信待ちは 1 回ずつ送る（省電力中は再送しない）
+    ota.pause()
+    power_save.cpu_low(log)
+    reapplied = False
+    try:
+        tick = 0
+        while not app.need_exit() and power_save_active(state):
+            check_scheduled_reboot(state)
+            tick += 1
+            if tick % 30 == 0 and power_save.cpu_low_keep(log) and not reapplied:
+                reapplied = True   # ログは 1 回だけ
+                log("[ INFO ] power save: cpu setting was reset by the system, re-applied")
+            time.sleep(1)
+    finally:
+        power_save.cpu_normal(log)
+        ota.resume()
+    if not app.need_exit():
+        log("[ INFO ] power save end, resuming detection")
+
+
+# ── 定期送信 ───────────────────────────────────────────────
+
+def send_interval(img, max_counts: dict, interval_labels: set):
+    """インターバル分の数値送信 + Google Drive アップロード"""
+    now = datetime.datetime.now()
+
+    for t in config.COUNT_TARGETS:
+        cnt = max_counts[t["name"]]
+        log(f"[ INFO ] sending {t['name']}={cnt}")
+        post_count(t["device_id"], t["token"], cnt)
+
+    # 検知ラベルごとのフォルダへアップロード（未検知は "no_detection"）。
+    # 検知ラベルは、送信直前の現在フレームではなく、インターバル内で
+    # 実際に検知された最後のフレームを使う（スナップショットが無ければ現在フレームにフォールバック）。
+    if interval_labels:
+        for label in interval_labels:
+            if not upload_last_detection(label, now):
+                upload_to_gdrive(img, label, now)
+    else:
+        upload_to_gdrive(img, "no_detection", now)
+
+
 # ── ターゲット判定 ─────────────────────────────────────────
 
 def match_targets(obj):
@@ -138,15 +244,29 @@ def match_targets(obj):
 def main(disp):
     log(f"[ INFO ] MODE={config.MODE}  model={config.MODEL_PATH}")
 
-    yolo = load_model(config.MODEL_PATH, config.MODEL_CLASS)
-    cam  = camera.Camera(yolo.input_width(), yolo.input_height(), yolo.input_format())
+    # 前回の省電力中に異常終了していても CPU を通常に戻す
+    power_save.cpu_normal(log)
+    ota_config.apply_saved(config, log)
+    ota = ota_config.OTAConfigChecker(config, log)
+    ota.start()
+    log(f"[ INFO ] power_save_time={config.POWER_SAVE_TIME}")
+
+    state = {"restart_triggered": False, "time_warned": False}
+
+    # 省電力時間帯に起動した場合は、カメラ・モデルを開く前に省電力へ入る
+    disp.set_backlight_off()   # 起動時に 1 回だけ消灯する（従来どおり）
+    if power_save_active(state):
+        run_power_save(disp, ota, state)
+        if app.need_exit():
+            return
+
+    cam, yolo = open_camera_and_model()
     ts   = touchscreen.TouchScreen()
 
     max_counts      = {t["name"]: 0 for t in config.COUNT_TARGETS}
     confirm_windows = {t["name"]: deque() for t in config.COUNT_TARGETS}
     next_post_time  = time.time() + config.INTERVAL
     interval_labels = set()   # インターバル内で確定検知されたラベル名
-    restart_triggered = False
 
     r, g, b = config.BOX_COLOR_RGB
     box_color = image.Color.from_rgb(r, g, b)
@@ -155,13 +275,32 @@ def main(disp):
 
     screen_on    = False
     prev_pressed = False
-    disp.set_backlight_off()
 
     log("[ INFO ] main loop started")
 
     while not app.need_exit():
         img = cam.read()
         if img is None:
+            continue
+
+        # 省電力時間帯: 推論・カメラ・送信（数値・画像）を止めて待機する（読んだフレームは捨てる）。
+        # 移行直前のインターバルで検知があった場合だけ、止める前にその分を送る。
+        if power_save_active(state):
+            if interval_labels:
+                log("[ INFO ] power save: sending detections of the last interval")
+                send_interval(img, max_counts, interval_labels)
+            cam.close()
+            del img, cam, yolo
+            gc.collect()
+            run_power_save(disp, ota, state, screen_on)
+            screen_on = False
+            if app.need_exit():
+                break
+            cam, yolo = open_camera_and_model()
+            max_counts      = {t["name"]: 0 for t in config.COUNT_TARGETS}
+            confirm_windows = {t["name"]: deque() for t in config.COUNT_TARGETS}
+            interval_labels = set()
+            next_post_time  = time.time() + config.INTERVAL
             continue
 
         w, h = img.width(), img.height()
@@ -262,34 +401,13 @@ def main(disp):
                 log("[ INFO ] screen off")
 
         # 毎日 04:00 に自己再起動（起動直後はスキップしてリブートループを防ぐ）
-        now_dt = datetime.datetime.now()
-        with open('/proc/uptime') as _f:
-            _uptime = float(_f.read().split()[0])
-        if now_dt.hour == 4 and now_dt.minute == 0 and not restart_triggered and _uptime > 300:
-            restart_triggered = True
-            log("[ INFO ] 04:00 scheduled reboot")
-            os.system("reboot")
+        check_scheduled_reboot(state)
 
         # 定期処理（HTTP送信 + Google Drive アップロード）
         if time.time() >= next_post_time:
-            now            = datetime.datetime.now()
             next_post_time = time.time() + config.INTERVAL
-
-            for t in config.COUNT_TARGETS:
-                cnt = max_counts[t["name"]]
-                log(f"[ INFO ] sending {t['name']}={cnt}")
-                post_count(t["device_id"], t["token"], cnt)
+            send_interval(img, max_counts, interval_labels)
             max_counts = {t["name"]: 0 for t in config.COUNT_TARGETS}
-
-            # 検知ラベルごとのフォルダへアップロード（未検知は "no_detection"）。
-            # 検知ラベルは、送信直前の現在フレームではなく、インターバル内で
-            # 実際に検知された最後のフレームを使う（スナップショットが無ければ現在フレームにフォールバック）。
-            if interval_labels:
-                for label in interval_labels:
-                    if not upload_last_detection(label, now):
-                        upload_to_gdrive(img, label, now)
-            else:
-                upload_to_gdrive(img, "no_detection", now)
             interval_labels = set()
 
 
