@@ -180,6 +180,9 @@ class OTAConfigChecker:
         if dev_id:
             device = self._fetch(f"{base_url}/devices/{dev_id}.json")
         if default is None and device is None:
+            # private リポジトリでトークンが無い／間違っている場合も 404 になる
+            self._log(f"[ ERROR ] OTA could not fetch any manifest from {base_url} "
+                      "(check network and /root/maixcam2_custom/github_token)")
             return {}
         manifest = _deep_merge(default if isinstance(default, dict) else {},
                                device if isinstance(device, dict) else {})

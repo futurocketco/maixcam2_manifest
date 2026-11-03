@@ -95,11 +95,13 @@ RTC（BM8563 / PCF8563 互換、I2C 1-0051）の割り込みがデバイスツ�
 
 | 設定 | 内容 |
 |---|---|
-| `OTA_MANIFEST_BASE_URL` | 例 `https://raw.githubusercontent.com/futurocketco/<repo>/main/manifest`。空なら OTA しない |
+| `OTA_MANIFEST_BASE_URL` | `https://raw.githubusercontent.com/futurocketco/maixcam2_manifest/main/manifest`。空なら OTA しない |
 | `OTA_DEVICE_ID` | `devices/<ID>.json` の ID（person の device_id を使う） |
 | `OTA_CHECK_INTERVAL` | 確認間隔（秒） |
 
-private リポジトリの場合は、機器の `/root/maixcam2_custom/github_token` にトークンを置く（リポジトリには入れない）。
+このリポジトリ (futurocketco/maixcam2_manifest) は private なので、機器の `/root/maixcam2_custom/github_token` に
+読み取り用のトークン（Contents: Read-only）を置く（リポジトリには入れない）。トークンが無いと manifest を取得できず、
+ログに `OTA could not fetch any manifest` が出る（設定は前の値のまま動き続ける）。
 
 ## ログ
 

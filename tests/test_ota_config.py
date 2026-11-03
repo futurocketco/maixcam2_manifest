@@ -104,3 +104,9 @@ def test_disabled_without_url():
     logs = []
     oc.OTAConfigChecker(make_config(OTA_MANIFEST_BASE_URL=""), logs.append).start()
     assert any("OTA disabled" in l for l in logs)
+
+
+def test_all_404_is_logged(tmp_path):
+    cfg, logs = make_config(), []
+    assert checker(cfg, tmp_path / "o.json", {}, logs).check_once() == {}
+    assert any("could not fetch any manifest" in l for l in logs)

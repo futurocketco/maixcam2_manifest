@@ -136,7 +136,7 @@ POWER_SAVE_TIME: str = "00000000"
 #   空文字なら OTA しない。manifest の書き方は README.md を参照
 ##################################################
 
-OTA_MANIFEST_BASE_URL: str = ""
+OTA_MANIFEST_BASE_URL: str = "https://raw.githubusercontent.com/futurocketco/maixcam2_manifest/main/manifest"
 OTA_DEVICE_ID        : str = "157"   # manifest/devices/<ID>.json（person の device_id を使う）
 OTA_CHECK_INTERVAL   : int = 3600    # 確認間隔（秒）
 
